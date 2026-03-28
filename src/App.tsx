@@ -26,11 +26,21 @@ import { cn } from './lib/utils';
 
 // --- Types ---
 
+declare global {
+  interface Window {
+    aistudio: {
+      hasSelectedApiKey: () => Promise<boolean>;
+      openSelectKey: () => Promise<void>;
+    };
+  }
+}
+
 type Page = 'home' | 'about' | 'faq' | 'contact';
 
 interface GeneratedVideo {
   id: string;
   url: string;
+  audioUrl?: string;
   prompt: string;
   poem: string;
   timestamp: number;
@@ -195,6 +205,9 @@ export default function App() {
   const [manualApiKey, setManualApiKey] = useState('');
   const [showKeyInput, setShowKeyInput] = useState(false);
   const [previewVideo, setPreviewVideo] = useState<GeneratedVideo | null>(null);
+  const [generationMode, setGenerationMode] = useState<'video' | 'image'>('image');
+  const [includeNarration, setIncludeNarration] = useState(true);
+  const [voice, setVoice] = useState<'Kore' | 'Fenrir' | 'Puck' | 'Charon' | 'Zephyr'>('Kore');
 
   useEffect(() => {
     // Check for saved manual key or platform key
@@ -219,6 +232,13 @@ export default function App() {
       setHasApiKey(true);
       setShowKeyInput(false);
     }
+  };
+
+  const handleResetKey = () => {
+    localStorage.removeItem('poetic_motion_api_key');
+    setManualApiKey('');
+    setHasApiKey(false);
+    setShowKeyInput(true);
   };
 
   const handleSelectKey = async () => {
@@ -246,75 +266,126 @@ export default function App() {
 
       const ai = new GoogleGenAI({ apiKey });
 
+      // Step 1: Generate Narration (if enabled)
+      let audioUrl = '';
+      if (includeNarration) {
+        setGenerationStatus('Generating AI narration...');
+        try {
+          const ttsResponse = await ai.models.generateContent({
+            model: "gemini-2.5-flash-preview-tts",
+            contents: [{ parts: [{ text: `Read this poem with deep emotion and perfect pacing: "${poem}"` }] }],
+            config: {
+              responseModalities: ['AUDIO' as any],
+              speechConfig: {
+                voiceConfig: {
+                  prebuiltVoiceConfig: { voiceName: voice },
+                },
+              },
+            },
+          });
+
+          const base64Audio = ttsResponse.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+          if (base64Audio) {
+            const binary = atob(base64Audio);
+            const bytes = new Uint8Array(binary.length);
+            for (let i = 0; i < binary.length; i++) {
+              bytes[i] = binary.charCodeAt(i);
+            }
+            const blob = new Blob([bytes], { type: 'audio/mpeg' });
+            audioUrl = URL.createObjectURL(blob);
+          }
+        } catch (err) {
+          console.error('Narration failed:', err);
+          // Don't block video generation if narration fails
+        }
+      }
+
       setGenerationStatus('Crafting visual prompts...');
       
-      // Step 1: Use Gemini to expand the poem into a visual prompt
+      // Step 2: Use Gemini to expand the poem into a visual prompt
       const promptResponse = await ai.models.generateContent({
         model: "gemini-3-flash-preview",
         contents: `Convert this poem into a highly descriptive, cinematic visual prompt for a video generation model. Focus on atmosphere, lighting, camera movement, and specific imagery. Poem: "${poem}"`,
       });
 
       const visualPrompt = promptResponse.text || poem;
-      setGenerationStatus('Generating cinematic animation (this may take a few minutes)...');
-
-      // Step 2: Generate Video using Veo
-      let operation = await ai.models.generateVideos({
-        model: 'veo-3.1-fast-generate-preview',
-        prompt: visualPrompt,
-        config: {
-          numberOfVideos: 1,
-          resolution: '1080p',
-          aspectRatio: '16:9'
-        }
-      });
-
-      // Poll for completion
-      while (!operation.done) {
-        await new Promise(resolve => setTimeout(resolve, 10000));
-        operation = await ai.operations.getVideosOperation({ operation: operation });
-        
-        // Update status periodically
-        const statuses = [
-          'Painting the scenes...',
-          'Rendering atmosphere...',
-          'Adding cinematic touches...',
-          'Finalizing your animation...'
-        ];
-        setGenerationStatus(statuses[Math.floor(Math.random() * statuses.length)]);
-      }
-
-      const downloadLink = operation.response?.generatedVideos?.[0]?.video?.uri;
       
-      if (downloadLink) {
-        // Fetch the video to get a blob URL (for local preview and download)
-        const response = await fetch(downloadLink, {
-          method: 'GET',
-          headers: {
-            'x-goog-api-key': apiKey!,
+      if (generationMode === 'video') {
+        setGenerationStatus('Generating cinematic video (Paid Mode)...');
+        // Step 3: Generate Video using Veo
+        let operation;
+        try {
+          operation = await ai.models.generateVideos({
+            model: 'veo-3.1-fast-generate-preview',
+            prompt: visualPrompt,
+            config: {
+              numberOfVideos: 1,
+              resolution: '1080p',
+              aspectRatio: '16:9'
+            }
+          });
+        } catch (err: any) {
+          if (err.message?.includes('403') || err.status === 403) {
+            throw new Error('PERMISSION_DENIED: Veo models require a Gemini API key from a PAID Google Cloud project. Switch to "Free Mode" to use the image animator instead.');
+          }
+          throw err;
+        }
+
+        // Poll for completion
+        while (!operation.done) {
+          await new Promise(resolve => setTimeout(resolve, 10000));
+          operation = await ai.operations.getVideosOperation({ operation: operation });
+          setGenerationStatus('Finalizing your animation...');
+        }
+
+        const downloadLink = operation.response?.generatedVideos?.[0]?.video?.uri;
+        if (downloadLink) {
+          const response = await fetch(downloadLink, {
+            method: 'GET',
+            headers: { 'x-goog-api-key': apiKey! },
+          });
+          const blob = await response.blob();
+          const videoUrl = URL.createObjectURL(blob);
+          addGeneratedMedia(videoUrl, visualPrompt, poem, audioUrl);
+        }
+      } else {
+        setGenerationStatus('Generating cinematic visual (Free Mode)...');
+        // Step 3: Generate High-Quality Image
+        const response = await ai.models.generateContent({
+          model: 'gemini-2.5-flash-image',
+          contents: {
+            parts: [{ text: `A cinematic, highly detailed, atmospheric visual representation of this poem: "${visualPrompt}". 16:9 aspect ratio, professional lighting.` }],
           },
         });
-        
-        const blob = await response.blob();
-        const videoUrl = URL.createObjectURL(blob);
 
-        const newVideo: GeneratedVideo = {
-          id: Date.now().toString(),
-          url: videoUrl,
-          prompt: visualPrompt,
-          poem: poem,
-          timestamp: Date.now()
-        };
-
-        setGeneratedVideos(prev => [newVideo, ...prev]);
-        setPoem('');
+        for (const part of response.candidates?.[0]?.content?.parts || []) {
+          if (part.inlineData) {
+            const imageUrl = `data:image/png;base64,${part.inlineData.data}`;
+            addGeneratedMedia(imageUrl, visualPrompt, poem, audioUrl);
+            break;
+          }
+        }
       }
-    } catch (error) {
+    } catch (error: any) {
       console.error('Generation failed:', error);
-      alert('Failed to generate video. Please try again.');
+      alert(error.message || 'Failed to generate animation. Please try again.');
     } finally {
       setIsGenerating(false);
       setGenerationStatus('');
     }
+  };
+
+  const addGeneratedMedia = (url: string, prompt: string, poem: string, audioUrl?: string) => {
+    const newMedia: GeneratedVideo = {
+      id: Date.now().toString(),
+      url: url,
+      audioUrl: audioUrl,
+      prompt: prompt,
+      poem: poem,
+      timestamp: Date.now()
+    };
+    setGeneratedVideos(prev => [newMedia, ...prev]);
+    setPoem('');
   };
 
   const downloadVideo = (url: string, id: string) => {
@@ -410,15 +481,75 @@ export default function App() {
                     </p>
                   </motion.div>
                 ) : (
-                  <div className="space-y-4">
-                    <div className="flex justify-end">
-                      <button 
-                        onClick={() => setShowKeyInput(true)}
-                        className="text-white/40 hover:text-orange-500 text-xs flex items-center gap-1 transition-colors"
-                      >
-                        <HelpCircle size={12} />
-                        Change API Key
-                      </button>
+                  <div className="space-y-6">
+                    <div className="flex flex-col sm:flex-row justify-between items-center gap-4">
+                      <div className="flex flex-col gap-4 w-full sm:w-auto">
+                        <div className="flex bg-white/5 p-1 rounded-full border border-white/10">
+                          <button 
+                            onClick={() => setGenerationMode('image')}
+                            className={cn(
+                              "px-6 py-2 rounded-full text-xs font-bold transition-all",
+                              generationMode === 'image' ? "bg-orange-500 text-white" : "text-white/40 hover:text-white"
+                            )}
+                          >
+                            FREE MODE
+                          </button>
+                          <button 
+                            onClick={() => setGenerationMode('video')}
+                            className={cn(
+                              "px-6 py-2 rounded-full text-xs font-bold transition-all",
+                              generationMode === 'video' ? "bg-orange-500 text-white" : "text-white/40 hover:text-white"
+                            )}
+                          >
+                            PAID MODE
+                          </button>
+                        </div>
+                        
+                        <div className="flex items-center gap-4 bg-white/5 p-2 px-4 rounded-2xl border border-white/10">
+                          <label className="flex items-center gap-2 cursor-pointer group">
+                            <input 
+                              type="checkbox" 
+                              checked={includeNarration}
+                              onChange={(e) => setIncludeNarration(e.target.checked)}
+                              className="w-4 h-4 rounded border-white/10 bg-black text-orange-500 focus:ring-orange-500"
+                            />
+                            <span className="text-xs font-bold text-white/60 group-hover:text-white transition-colors">Include Narration</span>
+                          </label>
+                          {includeNarration && (
+                            <select 
+                              value={voice}
+                              onChange={(e) => setVoice(e.target.value as any)}
+                              className="bg-transparent text-xs font-bold text-orange-500 outline-none cursor-pointer"
+                            >
+                              <option value="Kore">Kore (Warm)</option>
+                              <option value="Fenrir">Fenrir (Deep)</option>
+                              <option value="Puck">Puck (Cheerful)</option>
+                              <option value="Charon">Charon (Mysterious)</option>
+                              <option value="Zephyr">Zephyr (Soft)</option>
+                            </select>
+                          )}
+                        </div>
+                      </div>
+                      
+                      <div className="flex flex-col items-end gap-2">
+                        <div className="flex justify-end gap-4">
+                          {hasApiKey && (
+                            <button 
+                              onClick={handleResetKey}
+                              className="text-white/40 hover:text-red-500 text-xs flex items-center gap-1 transition-colors"
+                            >
+                              Reset & Clear Key
+                            </button>
+                          )}
+                          <button 
+                            onClick={() => setShowKeyInput(true)}
+                            className="text-white/40 hover:text-orange-500 text-xs flex items-center gap-1 transition-colors"
+                          >
+                            <HelpCircle size={12} />
+                            Change API Key
+                          </button>
+                        </div>
+                      </div>
                     </div>
                     <div className="bg-white/5 border border-white/10 rounded-3xl p-1 overflow-hidden focus-within:border-orange-500/50 transition-colors">
                       <textarea
@@ -445,7 +576,7 @@ export default function App() {
                             </>
                           ) : (
                             <>
-                              <Video size={20} />
+                              {generationMode === 'video' ? <Video size={20} /> : <Sparkles size={20} />}
                               <span>Animate Poem</span>
                             </>
                           )}
@@ -493,10 +624,21 @@ export default function App() {
                         className="group relative bg-white/5 border border-white/10 rounded-3xl overflow-hidden hover:border-orange-500/30 transition-colors"
                       >
                         <div className="relative aspect-video bg-black group-hover:cursor-pointer" onClick={() => setPreviewVideo(video)}>
-                          <video 
-                            src={video.url} 
-                            className="w-full h-full object-cover opacity-80 group-hover:opacity-100 transition-opacity"
-                          />
+                          {video.url.startsWith('data:image') ? (
+                            <div className="w-full h-full overflow-hidden">
+                              <motion.img 
+                                src={video.url} 
+                                animate={{ scale: [1, 1.1], x: [0, -10], y: [0, -5] }}
+                                transition={{ duration: 20, repeat: Infinity, repeatType: 'reverse' }}
+                                className="w-full h-full object-cover opacity-80 group-hover:opacity-100 transition-opacity"
+                              />
+                            </div>
+                          ) : (
+                            <video 
+                              src={video.url} 
+                              className="w-full h-full object-cover opacity-80 group-hover:opacity-100 transition-opacity"
+                            />
+                          )}
                           <div className="absolute inset-0 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity bg-black/40">
                             <div className="w-16 h-16 bg-white/20 backdrop-blur-md rounded-full flex items-center justify-center border border-white/30">
                               <Play className="text-white fill-white ml-1" size={32} />
@@ -557,13 +699,38 @@ export default function App() {
                         </button>
                       </div>
 
-                      <div className="aspect-video bg-black">
-                        <video 
-                          src={previewVideo.url} 
-                          controls 
-                          autoPlay
-                          className="w-full h-full"
-                        />
+                      <div className="aspect-video bg-black flex items-center justify-center overflow-hidden relative">
+                        {previewVideo.url.startsWith('data:image') ? (
+                          <motion.img 
+                            src={previewVideo.url} 
+                            animate={{ scale: [1, 1.15], x: [0, -20], y: [0, -10] }}
+                            transition={{ duration: 30, repeat: Infinity, repeatType: 'reverse' }}
+                            className="w-full h-full object-cover"
+                          />
+                        ) : (
+                          <video 
+                            id="preview-video-element"
+                            src={previewVideo.url} 
+                            controls 
+                            autoPlay
+                            className="w-full h-full"
+                          />
+                        )}
+                        {previewVideo.audioUrl && (
+                          <audio 
+                            id="preview-audio-element"
+                            src={previewVideo.audioUrl} 
+                            autoPlay
+                            onPlay={() => {
+                              const video = document.getElementById('preview-video-element') as HTMLVideoElement;
+                              if (video) video.play();
+                            }}
+                            onPause={() => {
+                              const video = document.getElementById('preview-video-element') as HTMLVideoElement;
+                              if (video) video.pause();
+                            }}
+                          />
+                        )}
                       </div>
 
                       <div className="p-6 md:p-8 bg-gradient-to-t from-black to-transparent">

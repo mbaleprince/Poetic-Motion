@@ -1,0 +1,6 @@
+{
+  "appId": "com.poeticmotion.app",
+  "appName": "Poetic Motion",
+  "webDir": "dist",
+  "bundledWebRuntime": false
+}
